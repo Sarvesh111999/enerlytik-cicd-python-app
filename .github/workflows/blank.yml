@@ -42,9 +42,9 @@ jobs:
       - name: Tag Docker image
         run: |
           docker tag cicd-python-app:${{ github.sha }} \
-            767397664515.dkr.ecr.ap-south-1.amazonaws.com/cicd-python-app:${{ github.sha }}
+            767397664515.dkr.ecr.ap-south-1.amazonaws.com/enerlytik-cicd-python-app:${{ github.sha }}
 
       - name: Push Docker image
         run: |
           docker push \
-            767397664515.dkr.ecr.ap-south-1.amazonaws.com/cicd-python-app:${{ github.sha }}
+            767397664515.dkr.ecr.ap-south-1.amazonaws.com/enerlytik-cicd-python-app:${{ github.sha }}
