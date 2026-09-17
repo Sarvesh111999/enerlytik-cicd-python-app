@@ -1,31 +1,58 @@
-name: Python CI
+```yaml
+name: Python CI + ECS Deploy
 
 on:
   push:
+    branches:
+      - main
 
 permissions:
   id-token: write
   contents: read
 
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: enerlytik-cicd-python-app
+  ECS_CLUSTER: enerlytik-production-cluster
+  ECS_SERVICE: enerlytik-backend-prod-app-service
+  ECS_TASK_DEFINITION: enerlytik-cicd-backend-prod-app-image-def
+  CONTAINER_NAME: enerlytik-backend-prod-app
+
 jobs:
-  test:
+  test-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
+
+      # --------------------------------------------------
+      # 1. Checkout source code
+      # --------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
 
+      # --------------------------------------------------
+      # 2. Setup Python
+      # --------------------------------------------------
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
+      # --------------------------------------------------
+      # 3. Install dependencies
+      # --------------------------------------------------
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # --------------------------------------------------
+      # 4. Run tests
+      # --------------------------------------------------
       - name: Run tests
         run: pytest
 
+      # --------------------------------------------------
+      # 5. Debug GitHub OIDC
+      # --------------------------------------------------
       - name: Debug GitHub OIDC
         run: |
           echo "Repository: $GITHUB_REPOSITORY"
@@ -34,17 +61,24 @@ jobs:
           echo "Event: $GITHUB_EVENT_NAME"
           echo "OIDC token request URL exists: ${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}"
 
+      # --------------------------------------------------
+      # 6. Debug GitHub repository IDs
+      # --------------------------------------------------
       - name: Debug GitHub repository IDs
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           echo "Repository: $GITHUB_REPOSITORY"
+
           curl -s \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$GITHUB_REPOSITORY" |
             python -c "import sys,json; d=json.load(sys.stdin); print('Repository ID:', d.get('id')); print('Owner ID:', d.get('owner',{}).get('id'))"
-      
+
+      # --------------------------------------------------
+      # 7. Debug actual OIDC claims
+      # --------------------------------------------------
       - name: Debug OIDC claims
         env:
           ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -55,25 +89,107 @@ jobs:
             python -c "import sys,json; print(json.load(sys.stdin)['value'])")
 
           python -c "import sys,base64,json; p=sys.stdin.read().split('.')[1]; p += '='*(-len(p)%4); d=json.loads(base64.urlsafe_b64decode(p)); print('sub:',d.get('sub')); print('aud:',d.get('aud')); print('repository:',d.get('repository')); print('ref:',d.get('ref')); print('repository_id:',d.get('repository_id')); print('repository_owner_id:',d.get('repository_owner_id'))" <<< "$TOKEN"
+
+      # --------------------------------------------------
+      # 8. Assume AWS IAM role using OIDC
+      # --------------------------------------------------
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::767397664515:role/GitHubActions-Enerlytik-ECR-Push
           aws-region: ap-south-1
 
+      # --------------------------------------------------
+      # 9. Login to ECR
+      # --------------------------------------------------
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
+      # --------------------------------------------------
+      # 10. Build Docker image
+      # --------------------------------------------------
       - name: Build Docker image
         run: |
-          docker build -t cicd-python-app:${{ github.sha }} .
+          docker build \
+            -t cicd-python-app:${{ github.sha }} .
 
+      # --------------------------------------------------
+      # 11. Tag Docker image
+      # --------------------------------------------------
       - name: Tag Docker image
         run: |
-          docker tag cicd-python-app:${{ github.sha }} \
-            767397664515.dkr.ecr.ap-south-1.amazonaws.com/enerlytik-cicd-python-app:${{ github.sha }}
+          docker tag \
+            cicd-python-app:${{ github.sha }} \
+            767397664515.dkr.ecr.ap-south-1.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
 
+      # --------------------------------------------------
+      # 12. Push Docker image to ECR
+      # --------------------------------------------------
       - name: Push Docker image
         run: |
           docker push \
-            767397664515.dkr.ecr.ap-south-1.amazonaws.com/enerlytik-cicd-python-app:${{ github.sha }}
+            767397664515.dkr.ecr.ap-south-1.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      # --------------------------------------------------
+      # 13. Download current ECS task definition
+      # --------------------------------------------------
+      - name: Download current ECS task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "$ECS_TASK_DEFINITION" \
+            --query taskDefinition \
+            --output json > task-definition-full.json
+
+      # --------------------------------------------------
+      # 14. Remove ECS-generated metadata
+      #     before registering the new revision
+      # --------------------------------------------------
+      - name: Prepare task definition
+        run: |
+          python - <<'PY'
+          import json
+
+          with open("task-definition-full.json") as f:
+              task = json.load(f)
+
+          fields_to_remove = [
+              "taskDefinitionArn",
+              "revision",
+              "status",
+              "requiresAttributes",
+              "compatibilities",
+              "registeredAt",
+              "registeredBy"
+          ]
+
+          for field in fields_to_remove:
+              task.pop(field, None)
+
+          with open("task-definition.json", "w") as f:
+              json.dump(task, f, indent=2)
+
+          print("Task definition prepared successfully.")
+          PY
+
+      # --------------------------------------------------
+      # 15. Replace image with current GitHub commit image
+      # --------------------------------------------------
+      - name: Render new image into task definition
+        id: render-task
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: 767397664515.dkr.ecr.ap-south-1.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      # --------------------------------------------------
+      # 16. Register new ECS revision + deploy service
+      # --------------------------------------------------
+      - name: Deploy ECS service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+```
