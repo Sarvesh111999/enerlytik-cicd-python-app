@@ -101,8 +101,22 @@ jobs:
       # 12. Push Docker image to ECR
       - name: Push Docker image
         run: |
-          docker push \
-            767397664515.dkr.ecr.ap-south-1.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          IMAGE_URI="767397664515.dkr.ecr.ap-south-1.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
+
+          if aws ecr describe-images \
+            --repository-name "${{ env.ECR_REPOSITORY }}" \
+            --image-ids imageTag="${{ github.sha }}" \
+            --region "${{ env.AWS_REGION }}" > /dev/null 2>&1; then
+
+            echo "Image already exists: $IMAGE_URI"
+            echo "Skipping push."
+
+          else
+
+            echo "Image does not exist. Pushing: $IMAGE_URI"
+            docker push "$IMAGE_URI"
+
+          fi
 
       # 13. Download current ECS task definition
       - name: Download current ECS task definition
